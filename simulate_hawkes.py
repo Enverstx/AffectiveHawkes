@@ -10,6 +10,52 @@ from typing   import Dict, Any, Optional
 from utils import compute_branching_ratio_version_a, get_covariance_matrix_version_b
 
 
+def _check_stability(model_type: str, params: Dict[str, Any]) -> None:
+    """
+    Checks if the model parameters satisfy the stationarity condition (branching ratio < 1).
+    Raises ValueError if the process is explosive.
+    """
+    epsilon = 1e-6 # Tolerance for floating point comparison
+    
+    if model_type == 'A':
+        # Version A: The branching ratio n*(m) depends on the mark m.
+        # Stability requires that the MAXIMUM possible branching ratio is < 1.
+        # Max occurs at the corners of [0,1]^2.
+        # Condition: max(f) = 0.5*alpha1 + 0.5*alpha2 + 0.25*alpha3 < 1
+        alpha = params['alpha']
+        if len(alpha) != 3:
+            raise ValueError("Version A requires alpha to be a tuple of length 3.")
+        
+        max_branching_ratio = 0.5 * alpha[0] + 0.5 * alpha[1] + 0.25 * alpha[2]
+        
+        if max_branching_ratio >= 1.0 - epsilon:
+            raise ValueError(
+                f"Unstable Parameters for Version A! Max branching ratio {max_branching_ratio:.4f} >= 1. "
+                "The process will explode. Please reduce alpha values."
+            )
+            
+    elif model_type == 'B':
+        # Version B: The exact branching ratio involves an integral over [0,1]^2 which has no closed form.
+        # However, we know that n*_[0,1]^2 <= n*_infinity.
+        # Therefore, we use the INFINITE-DOMAIN INTEGRAL (Gamma) as the conservative UPPER BOUND (Maximum Value).
+        # Condition: Gamma = (2 * pi * nu_v * nu_a) / sqrt(1 - rho^2) < 1
+        nu_v = params['nu_v']
+        nu_a = params['nu_a']
+        rho  = params['rho']
+        
+        if abs(rho) >= 1.0:
+             raise ValueError(f"Rho must be strictly between -1 and 1. Got {rho}.")
+
+        gamma_upper_bound = (2 * np.pi * nu_v * nu_a) / np.sqrt(1 - rho**2)
+        
+        if gamma_upper_bound >= 1.0 - epsilon:
+             raise ValueError(
+                f"Unstable Parameters for Version B! "
+                f"Infinite-domain branching ratio (Upper Bound) {gamma_upper_bound:.4f} >= 1. "
+                "The process will explode. Please reduce nu_v, nu_a or rho."
+            )
+
+
 def simulate_spatiotemporal_hawkes( T: float,
                                     model_type: str,
                                     params: Dict[str, Any],
@@ -30,7 +76,9 @@ def simulate_spatiotemporal_hawkes( T: float,
                 - Version A: 'alpha' (tuple), 'sigma'
                 - Version B: 'nu_v', 'nu_a', 'rho'
     T_e:        Temporal buffer extension magnitude.
+                RECOMMENDATION: Choose T_e >= 3.0 / beta to capture >95% of the temporal kernel.
     S_e:        Spatial buffer extension magnitude.
+                RECOMMENDATION: Choose S_e >= 3 * sigma (or 3 * max(nu_v, nu_a)) to capture >99% of the spatial kernel.
     seed:       Random seed for reproducibility.
 
     return values:
@@ -45,10 +93,15 @@ def simulate_spatiotemporal_hawkes( T: float,
     assert params['beta'] > 0,  f'Decay rate beta must be positive'
     assert params['mu0'] >= 0,  f'Background rate mu0 must be non-negative'
 
+    # Stability Check (Prevents infinite loops)
+    ####################################################################################################################
+    _check_stability(model_type, params)
+
     if seed is not None: np.random.seed(seed)
 
     # Setup Simulation Window (Buffer Method).
     # We simulate in [-T_e, T + T_e] x [-S_e, 1 + S_e]^2 to avoid edge effects.
+    # Events just outside [0,1] or before t=0 can still trigger events inside our window.
     ####################################################################################################################
     t_start_sim, t_end_sim = -T_e, T + T_e
     space_min, space_max   = -S_e, 1 + S_e
@@ -106,12 +159,14 @@ def simulate_spatiotemporal_hawkes( T: float,
             
         elif model_type == 'B':
             # Version B: Constant infinite-domain branching ratio.
+            # NOTE: We use the UPPER BOUND Gamma (integral over R^2) for simulation.
+            # Events falling outside the valid domain will be rejected in Step 2.3.
+            # This is mathematically equivalent to simulating the exact process.
             nu_v  = params['nu_v']
             nu_a  = params['nu_a']
             rho   = params['rho']
-            # Derived in Appendix A.3.2
-            gamma = (2 * np.pi * nu_v * nu_a) / np.sqrt(1 - rho**2)
-            n_offspring = np.random.poisson(gamma)
+            gamma_upper = (2 * np.pi * nu_v * nu_a) / np.sqrt(1 - rho**2)
+            n_offspring = np.random.poisson(gamma_upper)
         
         # 2.2 Generate Offspring Events.
         ################################################################################################################
@@ -138,7 +193,8 @@ def simulate_spatiotemporal_hawkes( T: float,
             a_child = parent['arousal'] + da
             
             # 2.3 Window-based Acceptance.
-            # Keep events in buffer zone to produce their own children, filter later.
+            # Only keep events that fall within the extended simulation window.
+            # This step implicitly handles the truncation of the spatial kernel for Version B.
             ############################################################################################################
             in_time  = t_start_sim <= t_child <= t_end_sim
             in_space = (space_min <= v_child <= space_max) and (space_min <= a_child <= space_max)

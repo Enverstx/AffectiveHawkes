@@ -25,7 +25,7 @@ def run_example_version_a():
     df_a = simulate_spatiotemporal_hawkes( T=100.0, 
                                            model_type='A', 
                                            params=params_a, 
-                                           seed=42 )
+                                           seed=1 )
     
     print(f"Generated {len(df_a)} events.")
     print(df_a.head())
